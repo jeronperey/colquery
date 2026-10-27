@@ -1,11 +1,19 @@
 table: 100000000 rows, 1526 blocks, 715.3 MB on disk (raw CSV 2388.9 MB, 3.34x smaller)
-row store loaded for baseline: 3200.0 MB in 2.7s
+row store loaded for baseline: 3200.0 MB in 2.2s
 
 query               vec+zm ms     vec ms     row ms    vs row   zm skip   Mrows/s
-full-scan agg            43.1       43.2     1163.2     27.0x      0.0%      2322
-group by string         185.7      184.7     1192.2      6.4x      0.0%       539
-filter+group            104.0      104.7     1090.3     10.5x      0.0%       962
-1% ts range               0.4       65.3     1240.8   2763.2x     99.0%    222697
-10% ts + country          8.9       66.0     1221.7    137.9x     90.0%     11285
+full-scan agg            42.2       42.0     1196.6     28.4x      0.0%      2370
+group by string         184.7      180.7     1369.4      7.4x      0.0%       541
+filter+group            138.7      141.2     1713.6     12.4x      0.0%       721
+1% ts range               0.6       86.1     1460.4   2530.4x     99.0%    173273
+10% ts + country          8.6       68.1     1212.2    141.7x     90.0%     11691
 
-geomean speedup vs row-at-a-time: 58.6x   (results identical across engines)
+geomean speedup vs row-at-a-time: 62.2x   (results identical across engines)
+
+parallel scaling (ms, speedup vs 1 thread), 10 hardware threads
+query                           1              2              4              8             10
+full-scan agg         55.2   1.0x    25.1   2.2x    17.6   3.1x    11.0   5.0x     8.6   6.4x
+group by string      195.4   1.0x    96.1   2.0x    49.9   3.9x    34.6   5.6x    31.4   6.2x
+filter+group         107.4   1.0x    54.1   2.0x    28.0   3.8x    20.0   5.4x    17.4   6.2x
+1% ts range            0.5   1.0x     0.3   1.7x     0.2   2.5x     0.2   2.5x     0.2   2.4x
+10% ts + country       8.0   1.0x     4.2   1.9x     2.2   3.6x     1.7   4.7x     1.6   5.1x

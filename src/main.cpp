@@ -3,6 +3,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <thread>
 
 #include "baseline.h"
 #include "exec.h"
@@ -181,7 +182,7 @@ int cmd_info(const std::string& file) {
 }
 
 // ---- query -----------------------------------------------------------------
-int cmd_query(const std::string& file, const std::string& sql, const std::string& engine) {
+int cmd_query(const std::string& file, const std::string& sql, const std::string& engine, unsigned threads) {
   Table t(file);
   Query q = parse_sql(sql);
   Plan p = make_plan(q, t);
@@ -197,7 +198,7 @@ int cmd_query(const std::string& file, const std::string& sql, const std::string
     printf("%s-- row-at-a-time, %.1f ms\n", r.to_string().c_str(), ms_since(t0));
   } else {
     ScanStats st;
-    Result r = run_vectorized(t, p, engine != "nozm", &st);
+    Result r = run_vectorized(t, p, engine != "nozm", &st, threads);
     printf("%s-- vectorized%s, %.1f ms, blocks scanned %zu / skipped %zu of %zu\n", r.to_string().c_str(),
            engine == "nozm" ? " (no zone maps)" : "", ms_since(t0), st.blocks_scanned, st.blocks_skipped,
            st.blocks_total);
@@ -293,14 +294,15 @@ int cmd_verify(const std::string& file) {
     Plan p = make_plan(q, t);
     Result ref = naive(t, rs, q, p);
     Result a = run_vectorized(t, p, true), b = run_vectorized(t, p, false), c = run_row_at_a_time(t, rs, p);
-    bool ok = a == ref && b == ref && c == ref;
+    Result d = run_vectorized(t, p, true, nullptr, 3);  // parallel path, odd thread count
+    bool ok = a == ref && b == ref && c == ref && d == ref;
     if (!ok) {
       bad++;
       printf("FAIL: %s\n--- expected\n%s--- vectorized\n%s--- row\n%s", sql.c_str(), ref.to_string().c_str(),
              a.to_string().c_str(), c.to_string().c_str());
     }
   }
-  printf("%zu/%zu queries match the brute-force reference across 3 engines\n", qs.size() - bad, qs.size());
+  printf("%zu/%zu queries match the brute-force reference across 4 engine configs\n", qs.size() - bad, qs.size());
   return bad ? 1 : 0;
 }
 
@@ -373,6 +375,28 @@ int cmd_bench(const std::string& file, bool skip_baseline) {
   }
   if (ng) printf("\ngeomean speedup vs row-at-a-time: %.1fx   (results %s)\n", std::exp(geo / ng),
                  all_ok ? "identical across engines" : "MISMATCH");
+
+  // Thread scaling of the vectorized engine (zone maps on), vs. its own 1-thread time.
+  unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+  std::vector<unsigned> tc = {1, 2, 4, 8};
+  if (hw > 8) tc.push_back(hw);
+  printf("\nparallel scaling (ms, speedup vs 1 thread), %u hardware threads\n%-18s", hw, "query");
+  for (unsigned n : tc) printf(" %14u", n);
+  printf("\n");
+  for (auto& bq : qs) {
+    Plan p = make_plan(parse_sql(bq.sql), t);
+    Result ref = run_vectorized(t, p, true);
+    printf("%-18s", bq.name);
+    double base = 0;
+    for (unsigned n : tc) {
+      Result r;
+      double ms = median_ms(5, [&] { r = run_vectorized(t, p, true, nullptr, n); });
+      if (n == 1) base = ms;
+      if (!(r == ref)) all_ok = false;
+      printf(" %7.1f %5.1fx", ms, base / ms);
+    }
+    printf("\n");
+  }
   return all_ok ? 0 : 1;
 }
 
@@ -382,7 +406,7 @@ void usage() {
           "  colquery gen <rows> <out.cq> [--csv file.csv]\n"
           "  colquery import <in.csv> <out.cq>\n"
           "  colquery info <file.cq>\n"
-          "  colquery query <file.cq> \"<sql>\" [--engine vec|nozm|row]\n"
+          "  colquery query <file.cq> \"<sql>\" [--engine vec|nozm|row] [--threads N]\n"
           "  colquery verify <file.cq>\n"
           "  colquery bench <file.cq> [--no-baseline]\n");
 }
@@ -400,7 +424,7 @@ int main(int argc, char** argv) {
     if (a.size() >= 3 && a[0] == "gen") return cmd_gen(std::stoull(a[1]), a[2], flag("--csv", ""));
     if (a.size() >= 3 && a[0] == "import") return cmd_import(a[1], a[2]);
     if (a.size() >= 2 && a[0] == "info") return cmd_info(a[1]);
-    if (a.size() >= 3 && a[0] == "query") return cmd_query(a[1], a[2], flag("--engine", "vec"));
+    if (a.size() >= 3 && a[0] == "query") return cmd_query(a[1], a[2], flag("--engine", "vec"), (unsigned)std::stoul(flag("--threads", "1")));
     if (a.size() >= 2 && a[0] == "verify") return cmd_verify(a[1]);
     if (a.size() >= 2 && a[0] == "bench")
       return cmd_bench(a[1], std::find(a.begin(), a.end(), "--no-baseline") != a.end());

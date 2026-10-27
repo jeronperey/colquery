@@ -2,10 +2,12 @@
 // Filters produce selection vectors with branchless compaction; aggregates run
 // tight per-column loops over the selected rows.
 #pragma once
+#include <atomic>
 #include <climits>
 #include <cstdio>
 #include <map>
 #include <memory>
+#include <thread>
 #include <unordered_map>
 
 #include "plan.h"
@@ -123,8 +125,8 @@ class Op {
 
 class ScanOp : public Op {
  public:
-  ScanOp(const Table& t, const Plan& p, bool zone_maps, ScanStats& st)
-      : t_(t), p_(p), zm_(zone_maps), st_(st), batch_(new Batch) {
+  ScanOp(const Table& t, const Plan& p, bool zone_maps, ScanStats& st, std::atomic<size_t>& next_block)
+      : t_(t), p_(p), zm_(zone_maps), st_(st), next_block_(next_block), batch_(new Batch) {
     cur_.resize(p.scan_cols.size());
     st_.blocks_total = t.nblocks;
   }
@@ -145,8 +147,8 @@ class ScanOp : public Op {
         st_.rows_scanned += n;
         return batch_.get();
       }
-      if (block_ >= t_.nblocks) return nullptr;
-      size_t b = block_++;
+      size_t b = next_block_.fetch_add(1, std::memory_order_relaxed);  // blocks are claimed dynamically
+      if (b >= t_.nblocks) return nullptr;
       skip_ = 0;
       bool prune = false;
       if (zm_) {
@@ -175,9 +177,10 @@ class ScanOp : public Op {
   const Plan& p_;
   bool zm_;
   ScanStats& st_;
+  std::atomic<size_t>& next_block_;
   std::unique_ptr<Batch> batch_;
   std::vector<ColumnCursor> cur_;
-  size_t block_ = 0, remaining_ = 0;
+  size_t remaining_ = 0;
   uint32_t skip_ = 0;
 };
 
@@ -336,20 +339,56 @@ class AggregateOp {
   std::unordered_map<int64_t, uint32_t> map_;
 };
 
-inline Result run_vectorized(const Table& t, const Plan& p, bool zone_maps, ScanStats* stats = nullptr) {
-  ScanStats local;
-  ScanStats& st = stats ? *stats : local;
-  st = ScanStats{};
-  st.blocks_total = t.nblocks;
+// Folds src's groups into dst by key (partial aggregates from another thread).
+inline void merge_into(AggState& dst, const AggState& src) {
+  std::unordered_map<int64_t, uint32_t> at;
+  for (size_t g = 0; g < dst.keys.size(); g++) at.emplace(dst.keys[g], (uint32_t)g);
+  for (size_t g = 0; g < src.keys.size(); g++) {
+    auto it = at.find(src.keys[g]);
+    uint32_t d = it != at.end() ? it->second : dst.add_group(src.keys[g]);
+    dst.cnt[d] += src.cnt[g];
+    for (size_t a = 0; a < dst.sum.size(); a++) {
+      dst.sum[a][d] += src.sum[a][g];
+      dst.mn[a][d] = std::min(dst.mn[a][d], src.mn[a][g]);
+      dst.mx[a][d] = std::max(dst.mx[a][d], src.mx[a][g]);
+    }
+  }
+}
+
+// threads > 1: each worker runs its own Scan -> Filter -> Aggregate pipeline,
+// claiming 64K-row blocks from a shared counter; partial states are merged.
+inline Result run_vectorized(const Table& t, const Plan& p, bool zone_maps, ScanStats* stats = nullptr,
+                             unsigned threads = 1) {
+  ScanStats total;
+  total.blocks_total = t.nblocks;
   if (p.always_false) {
-    st.blocks_skipped = t.nblocks;
+    total.blocks_skipped = t.nblocks;
+    if (stats) *stats = total;
     AggState empty(p.aggs.size());
     if (p.group_col < 0) empty.add_group(0);
     return finalize(t, p, empty);
   }
-  AggregateOp agg(std::make_unique<FilterOp>(std::make_unique<ScanOp>(t, p, zone_maps, st), p), p, t);
-  AggState s = agg.run();
-  return finalize(t, p, s);
+  threads = std::max(1u, std::min<unsigned>(threads, (unsigned)std::max<size_t>(1, t.nblocks)));
+  std::atomic<size_t> next_block{0};
+  std::vector<ScanStats> sts(threads);
+  std::vector<AggState> parts(threads, AggState(p.aggs.size()));
+  auto work = [&](unsigned i) {
+    AggregateOp agg(std::make_unique<FilterOp>(std::make_unique<ScanOp>(t, p, zone_maps, sts[i], next_block), p), p, t);
+    parts[i] = agg.run();
+  };
+  std::vector<std::thread> pool;
+  for (unsigned i = 1; i < threads; i++) pool.emplace_back(work, i);
+  work(0);
+  for (auto& th : pool) th.join();
+
+  for (unsigned i = 0; i < threads; i++) {
+    total.blocks_scanned += sts[i].blocks_scanned;
+    total.blocks_skipped += sts[i].blocks_skipped;
+    total.rows_scanned += sts[i].rows_scanned;
+    if (i) merge_into(parts[0], parts[i]);
+  }
+  if (stats) *stats = total;
+  return finalize(t, p, parts[0]);
 }
 
 }  // namespace cq
