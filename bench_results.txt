@@ -1,0 +1,11 @@
+table: 100000000 rows, 1526 blocks, 715.3 MB on disk (raw CSV 2388.9 MB, 3.34x smaller)
+row store loaded for baseline: 3200.0 MB in 2.7s
+
+query               vec+zm ms     vec ms     row ms    vs row   zm skip   Mrows/s
+full-scan agg            43.1       43.2     1163.2     27.0x      0.0%      2322
+group by string         185.7      184.7     1192.2      6.4x      0.0%       539
+filter+group            104.0      104.7     1090.3     10.5x      0.0%       962
+1% ts range               0.4       65.3     1240.8   2763.2x     99.0%    222697
+10% ts + country          8.9       66.0     1221.7    137.9x     90.0%     11285
+
+geomean speedup vs row-at-a-time: 58.6x   (results identical across engines)
